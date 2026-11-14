@@ -1,78 +1,115 @@
-# free-model-aggregator-01
+# Free Model Aggregator
 
-The best free AI model aggregator: one stdlib-only Node 22 server that speaks
-the OpenAI Chat Completions API and the Anthropic Messages API (JSON and SSE),
-routes every request to the best free model that can serve it across ten
-simulated free-tier providers, fails over when a provider refuses or runs out
-of budget, and exits 0 when the workload is done.
+One long-running program that serves every request with the best free model
+it can get, over ten simulated free-tier providers.
 
-## Run
+The client speaks either the OpenAI Chat Completions API or the Anthropic
+Messages API — JSON bodies or server-sent events — and this server answers
+both, by routing each request upstream to whichever free model is rated
+highest for exactly what that request needs.
+
+## How it runs
 
 ```sh
-node main.ts --list            # print the catalog the entry found, exit 0
-node main.ts                   # serve (needs MAKEFUN_PROMPT_FILE + MAKEFUN_ENV_URL)
+node main.ts
 ```
 
-The server reads the brief at `$MAKEFUN_PROMPT_FILE` (provider directory,
-quality table, workload manifest), probes each provider's catalog route in the
-provider's own wire, builds one catalog, listens on `0.0.0.0` at a free port
-(never 8080), POSTs `$MAKEFUN_ENV_URL/register`
-`{"protocol_version": 1, "port": <port>, "catalog": <catalog>}`, serves the
-client, polls `GET $MAKEFUN_ENV_URL/work` every 100 ms, and exits 0 when the
-env says `{"done": true}`.
+The trial hands the process two environment variables:
 
-## Routing
+- `MAKEFUN_PROMPT_FILE` — the brief: three JSON documents (the provider
+  directory, the sealed quality table, and the request manifest).
+- `MAKEFUN_ENV_URL` — the env: the simulated providers live under their base
+  paths there, and the register/work endpoints live there too.
 
-For each request, in arrival order (the manifest's row):
+On startup the server reads the brief, asks every provider's catalog route
+for its models in that provider's own wire, builds one catalog from the
+answers, registers it with the env, and then answers requests until the env
+says the work is done, at which point it exits 0.
 
-1. **Candidates** — every free model on a provider whose catalog probe
-   answered, meeting the request's requirements (tools / vision / JSON mode /
-   minimum context) from the sealed quality table's row where one exists, the
-   listing's own fields where it does not.
-2. **JSON-mode wire rule** — a request that carries `response_format`
-   `json_object`/`json_schema` is never sent down an Anthropic-wire provider:
-   that wire cannot carry `response_format`, so the echo would break. It goes
-   to an OpenAI-wire provider (the format passes through) or a Gemini-wire
-   provider (`generationConfig.responseMimeType: "application/json"`).
-3. **Order** — highest `rating_milli` first; ties prefer a provider whose wire
-   matches the client's wire (no translation means no translation risk), then
-   fewest calls so far, then the brief's provider order.
-4. **Failover** — a 402, 429, 5xx or unreachable provider is recorded as a
-   refusal and the request is retried on the next candidate, in order. After
-   2 consecutive refusals a provider is demoted to the end of the order until
-   it serves a request again. A 400/401 (a bug on our side, not provider
-   state) skips that candidate without counting a refusal.
-5. **One provider per request** — the first successful upstream call answers
-   the client; the entry never calls a second provider for a served request.
+```sh
+node main.ts --list
+```
 
-## The three wires
+prints the catalog as JSON and exits, without starting the server. It works
+with no brief at all, in which case the catalog is empty.
 
-| Client \ upstream | OpenAI | Anthropic | Gemini |
+## How a request is routed
+
+1. **Needs first.** The request's own body says what it needs: tools, an
+   image, a JSON response format, or a long prompt (over two thousand
+   characters of input text means it needs a 200,000-token window). Only
+   free models whose sealed capabilities meet every need are considered.
+2. **Best rating wins.** Candidates are ordered by the sealed
+   `rating_milli` for that provider and model. Ties break toward the wire
+   that matches the client's own API, then toward the provider with the
+   fewest calls so far, then toward the brief's provider order.
+3. **Refusals demote.** A provider that refuses twice in a row — a 402, a
+   429, a 5xx, or unreachable — is pushed to the back of the order until it
+   serves a request again. A 400 or 401 is the request's fault, not the
+   provider's, so it never demotes.
+4. **Failover is free.** If a call fails, the next best fitting model is
+   tried, until one answers or the list runs out.
+
+Two routing rules that matter more than they look:
+
+- A JSON-mode request never rides an Anthropic-wire provider: that wire has
+  no response format to carry, so its answer could never pass the JSON
+  check.
+- A streamed call to an OpenAI-wire provider asks for
+  `stream_options: { include_usage: true }`, or the streamed usage check has
+  nothing to read.
+
+## What it translates
+
+The client and the provider rarely speak the same wire, so the server
+translates both ways:
+
+| Client | Provider | Request | Answer |
 | --- | --- | --- | --- |
-| OpenAI | passthrough (+ `stream_options.include_usage` on streams, so the usage chunk exists) | request translated (system, images, tools, tool choice, stop); answer rebuilt as a completion | `generateContent` / `streamGenerateContent`, `systemInstruction`, `functionDeclarations`, `generationConfig` |
-| Anthropic | request rewritten to Chat Completions (the starter's translation); answer rebuilt as a Messages object / event stream | passthrough | same Gemini request shape, answer rebuilt as Messages |
+| OpenAI | OpenAI | as-is | as-is |
+| OpenAI | Anthropic | Chat Completions → Messages | Messages → Chat Completions |
+| OpenAI | Gemini | Chat Completions → generateContent | generateContent → Chat Completions |
+| Anthropic | OpenAI | Messages → Chat Completions | Chat Completions → Messages |
+| Anthropic | Anthropic | as-is | as-is |
+| Anthropic | Gemini | Messages → generateContent | generateContent → Messages |
 
-All six paths carry the client's fields faithfully (system, user text, image
-data, tool definitions, `max_tokens`, stop sequences, JSON mode) so the
-provider's deterministic `ANSWER ECHO` comes back whole, and all six map the
-provider's usage and stop reason back into the client's shape
-(`end_turn`/`stop`/`STOP` are one family; streamed Anthropic usage compares
-output tokens only, streamed OpenAI usage needs the `include_usage` chunk).
+Streams are translated frame by frame: OpenAI chunks to Anthropic events,
+Anthropic events to OpenAI chunks, Gemini frames to either. Usage is always
+reported exactly as the provider reported it, because the checks compare it
+token for token.
 
-## Determinism
+`GET /v1/models` lists exactly the registered free models, in the OpenAI
+list shape by default and in the Anthropic list shape when the request
+carries an `x-api-key` header.
 
-No wall clock and no unseeded randomness anywhere in routing or translation,
-so a replay leaves identical state. Listed models use fixed timestamps.
+## What it never does
 
-## Grade-local (practice trials, process driver)
+- It never reads the sealed per-trial numbers — budgets, failing call
+  numbers, outage points — and never hard-codes a provider, a model, or a
+  rating. Every routing input comes from the brief at runtime.
+- It never uses a clock or unseeded randomness, so a replay of a trial sees
+  the same requests and leaves the same state.
+- It never picks a paid model. The sealed table's free flag decides, and the
+  catalog reports free and paid models separately.
 
-| Variant | t0 | t1 | t2 | mean score | mean upstream_calls |
-| --- | --- | --- | --- | --- | --- |
-| **A greedy (this entry)** | **99** | **99** | **99** | **99** | **28.33** |
-| B spread | 99 | 99 | 99 | 99 | 30.00 |
-| C no-gemini | 92 | 92 | 92 | 92 | 30.00 |
-| D demote-after-1 | 99 | 99 | 99 | 99 | 28.67 |
+## Layout
 
-Per-component for A on every trial: quality 99, served 100, wire 100,
-failover 100, catalog 100. See `VARIANTS.md` for why A wins and what still
-beats it.
+- `main.ts` — the whole server: brief reading, catalog probing, routing,
+  the four request translators, the four response translators, the four
+  stream translators, the HTTP server, and the register/poll bootstrap.
+- `package.json` — Node 22, ES module, no dependencies.
+- `VARIANTS.md` — the routing variants that were tried and what they scored.
+- `LICENSE` — MIT.
+
+## Grade-local
+
+```sh
+node cli/makefun.mjs grade-local --kit . --bot <path-to-this-repo> --driver process --instances 3
+```
+
+run from inside the competition kit directory. The shipped variant scores
+99/99/99 across the three practice trials (quality 99, served 100, wire
+100, failover 100, catalog 100), with a mean of about 28 upstream calls per
+trial. Quality 100 is unreachable on trial 0: seventeen requests want the
+top-rated free model and its budget is twelve, so four of them ride one
+tier down.
