@@ -37,6 +37,8 @@ const FIXED_ANTHROPIC_CREATED_AT = "2026-01-01T00:00:00Z";
 // Routing policy. Variants graded in VARIANTS.md change only these values.
 const POLICY = {
   mode: "greedy", // "greedy" | "spread"
+  // 2, not 1: demoting after a single refusal also skips providers that would
+  // have served next, and graded one extra upstream call in total (variant D).
   demoteAfter: 2, // consecutive refusals before a provider is demoted
   spreadWindow: 25, // spread mode: rating milli within this of the best
   useGemini: true, // false: never route to a gemini-wire provider
